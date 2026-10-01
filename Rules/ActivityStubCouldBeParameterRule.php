@@ -55,9 +55,10 @@ use PHPStan\Rules\RuleErrorBuilder;
  * - a class that extends another, implements an interface or uses a trait: one of them may
  *   declare or call the workflow method, which then cannot gain a required parameter.
  *
- * Code that already fails is still reported, with a warning that the failure moves to the
- * worker's start: `of(0)`, a `nonRetryable` entry that is not a `\Throwable` class, a contract
- * with no `#[AsActivityMethod]`. The rule does not see another method calling the workflow
+ * Code that already fails, or a `nonRetryable` entry that never matches, is still reported, with
+ * a warning that the worker then refuses to register the workflow: `of(0)`, a `nonRetryable`
+ * entry that is not a `\Throwable` class, a contract with no `#[AsActivityMethod]`, and a
+ * contract that names no class or interface. The rule does not see another method calling the workflow
  * method, `__call`, reflection or `get_object_vars()` reaching the property, or the local name
  * used before the stub is built: those are its false positives.
  *

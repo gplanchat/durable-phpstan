@@ -139,10 +139,15 @@ when it can see that the move would change what runs:
 - a class that extends another, implements an interface or uses a trait, any of which may declare
   or call the workflow method.
 
-Code that already fails is still reported, with a warning: after the move, the worker refuses to
-register the workflow, where the source failed only on a run or on a call. That is the case for
-`of(0)`, a `nonRetryableExceptions` entry that is not a `\Throwable` class (an unknown class, or
-`self::class` in a workflow), and a contract with no `#[AsActivityMethod]` method.
+Code that already fails, or a `nonRetryableExceptions` entry that never matches, is still
+reported, with a warning: after the move, the worker refuses to register the workflow. That is the
+case for:
+
+- `of(0)`, which fails on every run;
+- a `nonRetryableExceptions` entry that is not a `\Throwable` class (an unknown class, or
+  `self::class` in a workflow): `of()` accepts it, and it never matches an exception;
+- a contract with no `#[AsActivityMethod]` method, which fails on the first call;
+- a contract that names no class or interface.
 
 The rule does not see every way code reaches the stub. In these cases a report can be a false
 positive, and the stub has to stay:
