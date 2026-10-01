@@ -127,15 +127,31 @@ attempts: 3)] ActivityStub $orders, documented with @param ActivityStub<OrderAct
 
 It reports a stub built in the workflow method, or built in the constructor and read by that
 method only, with no options or with `ActivityOptions::of()` and literal values. It stays silent
-when the move would change what runs:
+when it can see that the move would change what runs:
 
 - options computed at run time, `ActivityOptions::default()`, an `of()` that sets nothing or only
   an empty `nonRetryableExceptions` list (the attribute would build the stub with no options, and
   the Durable worker would retry without backoff), an empty `taskQueue`, an `activityId`, or a
   `backoffCoefficient` or `maximumInterval` the attribute refuses at registration;
-- a stub that a signal, update or helper method reads, or that a closure reads;
+- a stub that a signal, update or helper method reads, that the constructor reads after building
+  it, or that a closure, an arrow function or an anonymous class reads;
+- a local name assigned twice, or one that is already a parameter of the method;
 - a class that extends another, implements an interface or uses a trait, any of which may declare
   or call the workflow method.
+
+Code that already fails is still reported, with a warning: after the move, the worker refuses to
+register the workflow, where the source failed only on a run or on a call. That is the case for
+`of(0)`, a `nonRetryableExceptions` entry that is not a `\Throwable` class (an unknown class, or
+`self::class` in a workflow), and a contract with no `#[AsActivityMethod]` method.
+
+The rule does not see every way code reaches the stub. In these cases a report can be a false
+positive, and the stub has to stay:
+
+- another method of the class calls the workflow method, which would then lack the stub;
+- `__call` or a variable method name reaches the workflow method;
+- reflection, `get_object_vars()` or an `(array)` cast reads the property;
+- the local name is used before the stub is built, for example in an `isset()` or a by-reference
+  argument.
 
 When the stub must stay where it is, ignore the report in `phpstan.neon`:
 
