@@ -6,6 +6,7 @@ namespace Gplanchat\Durable\PHPStan\Rules;
 
 use Gplanchat\Durable\Activity\ActivityCancellationType;
 use Gplanchat\Durable\Activity\ActivityOptions;
+use Gplanchat\Durable\Attribute\AsActivityMethod;
 use Gplanchat\Durable\Attribute\AsWorkflowMethod;
 use PhpParser\Node;
 use PhpParser\Node\Expr;
@@ -31,6 +32,7 @@ use PhpParser\NodeFinder;
 use PhpParser\PrettyPrinter\Standard;
 use PHPStan\Analyser\Scope;
 use PHPStan\Node\InClassNode;
+use PHPStan\Reflection\ReflectionProvider;
 use PHPStan\Rules\IdentifierRuleError;
 use PHPStan\Rules\Rule;
 use PHPStan\Rules\RuleErrorBuilder;
@@ -45,10 +47,19 @@ use PHPStan\Rules\RuleErrorBuilder;
  * - options that are not literals, or literals the attribute cannot carry with the same meaning:
  *   `default()` or an `of()` that sets nothing (the attribute would then build the stub with no
  *   options, and the Durable worker would retry with no backoff), an empty `taskQueue` (which the
- *   attribute refuses), an `activityId`, or values the attribute refuses at registration;
- * - a stub read anywhere but one workflow method, or inside a closure;
+ *   attribute refuses), an `activityId`, or a `backoffCoefficient` or `maximumInterval` the
+ *   attribute refuses at registration where `of()` let the stub be built;
+ * - a stub read anywhere but one workflow method, the constructor that builds it included, or
+ *   inside a closure, an arrow function or an anonymous class;
+ * - a local name assigned twice, or that is already a parameter of the method;
  * - a class that extends another, implements an interface or uses a trait: one of them may
  *   declare or call the workflow method, which then cannot gain a required parameter.
+ *
+ * Code that already fails is still reported, with a warning that the failure moves to the
+ * worker's start: `of(0)`, a `nonRetryable` entry that is not a `\Throwable` class, a contract
+ * with no `#[AsActivityMethod]`. The rule does not see another method calling the workflow
+ * method, `__call`, reflection or `get_object_vars()` reaching the property, or the local name
+ * used before the stub is built: those are its false positives.
  *
  * @implements Rule<InClassNode>
  */
@@ -70,7 +81,9 @@ final class ActivityStubCouldBeParameterRule implements Rule
         'cancellationType' => 'cancellationType',
     ];
 
-    private const TIP = 'Keep activityStub() when the options are computed at run time, or when a signal, update or helper method, or a closure, uses the stub. Otherwise ignore this with the identifier ' . self::IDENTIFIER . '.';
+    private const TIP = 'Keep activityStub() when the options are computed at run time, or when a signal, update or helper method, or a closure, uses the stub. The rule does not see another method calling the workflow method, __call, reflection or get_object_vars() reaching the property, or the local name used before the stub is built. Otherwise ignore this with the identifier ' . self::IDENTIFIER . '.';
+
+    public function __construct(private readonly ReflectionProvider $reflectionProvider) {}
 
     public function getNodeType(): string
     {
@@ -104,8 +117,9 @@ final class ActivityStubCouldBeParameterRule implements Rule
         foreach ($workflowMethods as $method) {
             foreach ($method->stmts ?? [] as $stmt) {
                 if ($stmt instanceof Expression && $stmt->expr instanceof Assign
-                    && $stmt->expr->var instanceof Variable && \is_string($stmt->expr->var->name)) {
-                    $errors[] = self::report($stmt->expr->expr, $stmt->expr->var->name, $method);
+                    && $stmt->expr->var instanceof Variable && \is_string($stmt->expr->var->name)
+                    && self::isOnlyAssignment($method, $stmt->expr->var->name)) {
+                    $errors[] = $this->report($stmt->expr->expr, $stmt->expr->var->name, $method, $node->getClassReflection()->getName());
                 }
             }
         }
@@ -117,7 +131,7 @@ final class ActivityStubCouldBeParameterRule implements Rule
                 $name = $stmt->expr->var->name->toString();
                 $reader = self::onlyReader($class, $name);
                 if (null !== $reader && isset($workflowMethods[$reader])) {
-                    $errors[] = self::report($stmt->expr->expr, $name, $workflowMethods[$reader]);
+                    $errors[] = $this->report($stmt->expr->expr, $name, $workflowMethods[$reader], $node->getClassReflection()->getName());
                 }
             }
         }
@@ -125,7 +139,7 @@ final class ActivityStubCouldBeParameterRule implements Rule
         return array_values(array_filter($errors));
     }
 
-    private static function report(Expr $call, string $name, ClassMethod $method): ?IdentifierRuleError
+    private function report(Expr $call, string $name, ClassMethod $method, string $className): ?IdentifierRuleError
     {
         if (!$call instanceof MethodCall || !$call->name instanceof Identifier || 'activityStub' !== $call->name->toString()) {
             return null;
@@ -150,13 +164,15 @@ final class ActivityStubCouldBeParameterRule implements Rule
         foreach ($fields as $field => $value) {
             $attribute .= ', ' . $field . ': ' . $printer->prettyPrintExpr($value);
         }
+        $refusals = $this->refusals($contract->class->toString(), $fields, $className);
 
         return RuleErrorBuilder::message(\sprintf(
-            'Activity stub $%2$s could be a parameter of %1$s(): #[Activities(%3$s)] ActivityStub $%2$s, documented with @param ActivityStub<%4$s> $%2$s.',
+            'Activity stub $%2$s could be a parameter of %1$s(): #[Activities(%3$s)] ActivityStub $%2$s, documented with @param ActivityStub<%4$s> $%2$s.%5$s',
             $method->name->toString(),
             $name,
             $attribute,
             $short,
+            [] === $refusals ? '' : ' Warning: after the move, the worker refuses to register the workflow: ' . implode('; ', $refusals) . '.',
         ))
             ->identifier(self::IDENTIFIER)
             ->tip(self::TIP)
@@ -222,6 +238,77 @@ final class ActivityStubCouldBeParameterRule implements Rule
         return $fields;
     }
 
+    /**
+     * What the loader refuses when it registers the workflow, where the source fails only on a run
+     * or on a call.
+     *
+     * @param array<string, Expr> $fields
+     *
+     * @return list<string>
+     */
+    private function refusals(string $contract, array $fields, string $className): array
+    {
+        $refusals = [];
+        if (($fields['attempts'] ?? null) instanceof Int_ && $fields['attempts']->value < 1) {
+            $refusals[] = \sprintf('attempts: %d is not a number of attempts', $fields['attempts']->value);
+        }
+        $nonRetryable = $fields['nonRetryable'] ?? null;
+        foreach ($nonRetryable instanceof Expr\Array_ ? $nonRetryable->items : [] as $item) {
+            $class = $item->value instanceof String_ ? ltrim($item->value->value, '\\') : null;
+            if ($item->value instanceof ClassConstFetch && $item->value->class instanceof Name) {
+                $class = $item->value->class->isSpecialClassName() ? $className : $item->value->class->toString();
+            }
+            if (null !== $class && !$this->isThrowable($class)) {
+                $refusals[] = \sprintf('nonRetryable: %s is not a \\Throwable class', $class);
+            }
+        }
+        if (!$this->reflectionProvider->hasClass($contract)) {
+            $refusals[] = \sprintf('%s names no class or interface', $contract);
+        } elseif (!self::declaresActivityMethod($this->reflectionProvider->getClass($contract)->getNativeReflection())) {
+            $refusals[] = \sprintf('%s declares no #[AsActivityMethod]', $contract);
+        }
+
+        return $refusals;
+    }
+
+    private function isThrowable(string $class): bool
+    {
+        if (!$this->reflectionProvider->hasClass($class)) {
+            return false;
+        }
+        $reflection = $this->reflectionProvider->getClass($class);
+
+        return \Throwable::class === $reflection->getName() || $reflection->implementsInterface(\Throwable::class);
+    }
+
+    /**
+     * @param \ReflectionClass<object> $contract
+     */
+    private static function declaresActivityMethod(\ReflectionClass $contract): bool
+    {
+        foreach ($contract->getMethods() as $method) {
+            if ([] !== $method->getAttributes(AsActivityMethod::class)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** A second write, or a parameter of the same name, means the stub is not the only value. */
+    private static function isOnlyAssignment(ClassMethod $method, string $name): bool
+    {
+        foreach ($method->params as $param) {
+            if ($param->var instanceof Variable && $name === $param->var->name) {
+                return false;
+            }
+        }
+        $writes = (new NodeFinder())->find($method->stmts ?? [], static fn(Node $n): bool => $n instanceof Assign
+            && $n->var instanceof Variable && $name === $n->var->name);
+
+        return 1 === \count($writes);
+    }
+
     private static function isClassList(Expr $value): bool
     {
         if (!$value instanceof Expr\Array_) {
@@ -229,7 +316,7 @@ final class ActivityStubCouldBeParameterRule implements Rule
         }
         foreach ($value->items as $item) {
             if (null !== $item->key || $item->unpack || $item->byRef
-                || !($item->value instanceof ClassConstFetch && $item->value->class instanceof Name || $item->value instanceof String_)) {
+                || !(self::isClassName($item->value) || $item->value instanceof String_)) {
                 return false;
             }
         }
@@ -246,6 +333,12 @@ final class ActivityStubCouldBeParameterRule implements Rule
         $finder = new NodeFinder();
         $reads = static fn(Node $n): bool => ($n instanceof PropertyFetch || $n instanceof NullsafePropertyFetch)
             && (!$n->name instanceof Identifier || $name === $n->name->toString());
+        // The constructor writes the property; any other fetch there reads it.
+        $constructor = $class->getMethod('__construct')->stmts ?? [];
+        $writes = $finder->find($constructor, static fn(Node $n): bool => $n instanceof Assign && $reads($n->var));
+        if (\count($finder->find($constructor, $reads)) > \count($writes)) {
+            return null;
+        }
         $readers = [];
         foreach ($class->getMethods() as $method) {
             if ('__construct' === $method->name->toLowerString() || null === $finder->findFirst($method->stmts ?? [], $reads)) {
@@ -260,6 +353,12 @@ final class ActivityStubCouldBeParameterRule implements Rule
         }
 
         return 1 === \count($readers) ? $readers[0] : null;
+    }
+
+    private static function isClassName(Expr $value): bool
+    {
+        return $value instanceof ClassConstFetch && $value->class instanceof Name
+            && $value->name instanceof Identifier && 'class' === $value->name->toLowerString();
     }
 
     private static function isThis(Expr $expr): bool
