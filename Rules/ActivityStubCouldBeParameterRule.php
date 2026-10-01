@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Gplanchat\Durable\PHPStan\Rules;
 
+use Gplanchat\Durable\Activity\ActivityCancellationType;
+use Gplanchat\Durable\Activity\ActivityOptions;
 use Gplanchat\Durable\Attribute\AsWorkflowMethod;
 use PhpParser\Node;
 use PhpParser\Node\Expr;
@@ -11,16 +13,22 @@ use PhpParser\Node\Expr\ArrowFunction;
 use PhpParser\Node\Expr\Assign;
 use PhpParser\Node\Expr\ClassConstFetch;
 use PhpParser\Node\Expr\Closure;
+use PhpParser\Node\Expr\ConstFetch;
 use PhpParser\Node\Expr\MethodCall;
 use PhpParser\Node\Expr\NullsafePropertyFetch;
 use PhpParser\Node\Expr\PropertyFetch;
+use PhpParser\Node\Expr\StaticCall;
 use PhpParser\Node\Expr\Variable;
 use PhpParser\Node\Identifier;
 use PhpParser\Node\Name;
+use PhpParser\Node\Scalar\Float_;
+use PhpParser\Node\Scalar\Int_;
+use PhpParser\Node\Scalar\String_;
 use PhpParser\Node\Stmt\Class_;
 use PhpParser\Node\Stmt\ClassMethod;
 use PhpParser\Node\Stmt\Expression;
 use PhpParser\NodeFinder;
+use PhpParser\PrettyPrinter\Standard;
 use PHPStan\Analyser\Scope;
 use PHPStan\Node\InClassNode;
 use PHPStan\Rules\IdentifierRuleError;
@@ -47,6 +55,20 @@ use PHPStan\Rules\RuleErrorBuilder;
 final class ActivityStubCouldBeParameterRule implements Rule
 {
     public const IDENTIFIER = 'durable.activityStubCouldBeParameter';
+
+    /** `ActivityOptions::of()`'s parameters, in order, and the attribute field each maps to. */
+    private const OF_TO_ATTRIBUTE = [
+        'retryLimit' => 'attempts',
+        'timeouts' => 'startToClose',
+        'initialInterval' => 'initialInterval',
+        'nonRetryableExceptions' => 'nonRetryable',
+        'taskQueue' => 'taskQueue',
+        'backoffCoefficient' => 'backoffCoefficient',
+        'maximumInterval' => 'maximumInterval',
+        'summary' => 'summary',
+        'activityId' => null,
+        'cancellationType' => 'cancellationType',
+    ];
 
     private const TIP = 'Keep activityStub() when the options are computed at run time, or when a signal, update or helper method, or a closure, uses the stub. Otherwise ignore this with the identifier ' . self::IDENTIFIER . '.';
 
@@ -115,13 +137,19 @@ final class ActivityStubCouldBeParameterRule implements Rule
             || !$contract->name instanceof Identifier || 'class' !== $contract->name->toLowerString()) {
             return null;
         }
-        // Options are not mapped to attribute fields yet.
-        if (isset($args[1])) {
+        $fields = isset($args[1]) ? self::fields($args[1]->value) : [];
+        // Options given, but none the attribute would carry: it would build the stub with no
+        // options at all, which is not the same as a default `ActivityOptions`.
+        if (null === $fields || (isset($args[1]) && [] === $fields)) {
             return null;
         }
 
         $short = $contract->class->getLast();
+        $printer = new Standard();
         $attribute = $short . '::class';
+        foreach ($fields as $field => $value) {
+            $attribute .= ', ' . $field . ': ' . $printer->prettyPrintExpr($value);
+        }
 
         return RuleErrorBuilder::message(\sprintf(
             'Activity stub $%2$s could be a parameter of %1$s(): #[Activities(%3$s)] ActivityStub $%2$s, documented with @param ActivityStub<%4$s> $%2$s.',
@@ -134,6 +162,79 @@ final class ActivityStubCouldBeParameterRule implements Rule
             ->tip(self::TIP)
             ->line($call->getStartLine())
             ->build();
+    }
+
+    /**
+     * The `#[Activities]` fields that say what the options say, or null when they cannot.
+     *
+     * @return array<string, Expr>|null
+     */
+    private static function fields(Expr $options): ?array
+    {
+        if (!$options instanceof StaticCall || !$options->class instanceof Name || ActivityOptions::class !== $options->class->toString()
+            || !$options->name instanceof Identifier || 'of' !== $options->name->toLowerString()) {
+            return null;
+        }
+        $parameters = array_keys(self::OF_TO_ATTRIBUTE);
+        $fields = [];
+        $numbers = [];
+        foreach ($options->args as $position => $arg) {
+            if (!$arg instanceof Node\Arg || $arg->unpack) {
+                return null;
+            }
+            $parameter = null === $arg->name ? ($parameters[$position] ?? null) : $arg->name->toString();
+            if (null === $parameter || !\array_key_exists($parameter, self::OF_TO_ATTRIBUTE)) {
+                return null;
+            }
+            $value = $arg->value;
+            if ($value instanceof ConstFetch && 'null' === $value->name->toLowerString()) {
+                continue;
+            }
+            $field = self::OF_TO_ATTRIBUTE[$parameter];
+            $accepted = match ($field) {
+                'attempts' => $value instanceof Int_,
+                'startToClose', 'initialInterval', 'maximumInterval', 'backoffCoefficient' => $value instanceof Int_ || $value instanceof Float_,
+                'nonRetryable' => self::isClassList($value),
+                // `of()` reads '' as no queue; the attribute refuses it.
+                'taskQueue' => $value instanceof String_ && '' !== $value->value,
+                'summary' => $value instanceof String_,
+                'cancellationType' => $value instanceof ClassConstFetch && $value->class instanceof Name && ActivityCancellationType::class === $value->class->toString(),
+                default => false,
+            };
+            if (!$accepted || null === $field) {
+                return null;
+            }
+            // An empty list is the default on both sides: say nothing.
+            if ($value instanceof Expr\Array_ && [] === $value->items) {
+                continue;
+            }
+            $fields[$field] = $value;
+            if ($value instanceof Int_ || $value instanceof Float_) {
+                $numbers[$field] = (float) $value->value;
+            }
+        }
+        // The attribute refuses at registration what `of()` lets through to scheduling.
+        if (($numbers['backoffCoefficient'] ?? 1.0) < 1.0
+            || ($numbers['maximumInterval'] ?? \INF) < ($numbers['initialInterval'] ?? 1.0)) {
+            return null;
+        }
+
+        return $fields;
+    }
+
+    private static function isClassList(Expr $value): bool
+    {
+        if (!$value instanceof Expr\Array_) {
+            return false;
+        }
+        foreach ($value->items as $item) {
+            if (null !== $item->key || $item->unpack || $item->byRef
+                || !($item->value instanceof ClassConstFetch && $item->value->class instanceof Name || $item->value instanceof String_)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
